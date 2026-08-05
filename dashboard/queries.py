@@ -35,7 +35,7 @@ def get_current_avg_wait(conn) -> dict:
         SELECT 
             ROUND(AVG(wt.wait_minutes)) as avg_wait_now,
             COUNT(DISTINCT wt.attraction_id) as num_attractions,
-            MAX(wt.sampled_at) as last_sample
+            MAX(wt.sampled_at AT TIME ZONE 'Europe/Paris') as last_sample
         FROM wait_times wt, latest
         WHERE wt.sampled_at >= latest.last_ts - INTERVAL '30 minutes'
           AND wt.status = 'OPERATING'
@@ -151,12 +151,12 @@ def get_overview_stats(conn) -> dict:
     - Data primo e ultimo campionamento
     - Tabella riepilogativa per attrazione
     """
-    # Totale campionamenti e date estreme
+    # Totale campionamenti e date estreme (convertite a Europe/Paris)
     query_totals = """
         SELECT 
             COUNT(*) as total_samples,
-            MIN(sampled_at) as first_sample,
-            MAX(sampled_at) as last_sample
+            MIN(sampled_at AT TIME ZONE 'Europe/Paris') as first_sample,
+            MAX(sampled_at AT TIME ZONE 'Europe/Paris') as last_sample
         FROM wait_times;
     """
     df_totals = pd.read_sql(query_totals, conn)
@@ -170,7 +170,7 @@ def get_overview_stats(conn) -> dict:
             COUNT(*) as num_samples,
             ROUND(AVG(wait_minutes)) as avg_wait,
             ROUND(AVG(single_rider_minutes)) as avg_single_rider,
-            MAX(sampled_at) as last_sample
+            MAX(sampled_at AT TIME ZONE 'Europe/Paris') as last_sample
         FROM wait_times
         WHERE status = 'OPERATING'
         GROUP BY attraction_name, park, entity_type
