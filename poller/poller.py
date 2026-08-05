@@ -21,7 +21,7 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 # Importa i moduli del poller
 from fetcher import get_live_data, parse_attraction, parse_show
 from db import ensure_schema, insert_wait_time, insert_show_schedule, get_connection
-from alerts import check_and_alert, send_cycle_summary
+from alerts import check_and_alert, send_cycle_summary, check_pa_alert
 from telegram_bot import start_bot
 
 # Configurazione logging — stdout per Railway
@@ -155,6 +155,8 @@ def run_cycle(parks: list):
                         insert_wait_time(record)
                         # Controlla se mandare alert Telegram (coda bassa)
                         check_and_alert(conn, record)
+                        # Controlla se il PA offre uno slot nella fascia desiderata
+                        check_pa_alert(record)
                         inserted += 1
                     else:
                         skipped += 1

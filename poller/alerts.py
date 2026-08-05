@@ -128,6 +128,102 @@ def check_and_alert(conn, record: dict):
         logger.error(f"Errore nel check alert per '{attraction_name}': {e}")
 
 
+# === PREMIER ACCESS ALERT ===
+# Configurazione fasce orarie desiderate per il PA
+# Formato: nome_attrazione → (ora_inizio, ora_fine) dello slot di RETURN desiderato
+PA_ALERT_CONFIG = {
+    "Crush's Coaster": (16, 20),
+    "Frozen Ever After": (16, 20),
+    "Big Thunder Mountain": (9, 13),
+    "Star Wars Hyperspace Mountain": (9, 13),
+}
+
+# Tiene traccia degli alert già inviati per non spammare
+# Chiave: (attraction_name, data, return_hour) → True se già notificato
+_pa_alerts_sent = {}
+
+
+def check_pa_alert(record: dict):
+    """
+    Controlla se il Premier Access di un'attrazione target offre uno slot
+    nella fascia oraria desiderata. Se sì, invia un alert Telegram.
+    
+    L'alert viene inviato UNA SOLA VOLTA per attrazione/giorno/slot
+    (evita spam ogni 30 min).
+    
+    Args:
+        record: Record appena processato dal poller con premier_access_* fields.
+    """
+    if not os.environ.get("TELEGRAM_BOT_TOKEN"):
+        return
+    
+    attraction_name = record.get("attraction_name", "")
+    pa_state = record.get("premier_access_state")
+    pa_return_start = record.get("premier_access_return_start")
+    pa_price = record.get("premier_access_price")
+    
+    # Verifica che sia un'attrazione target con PA disponibile
+    if attraction_name not in PA_ALERT_CONFIG:
+        return
+    if pa_state != "AVAILABLE" or not pa_return_start:
+        return
+    
+    # Parsing dell'ora del return slot
+    try:
+        if isinstance(pa_return_start, str):
+            return_dt = datetime.fromisoformat(pa_return_start)
+        else:
+            return_dt = pa_return_start
+        
+        # Converti a Europe/Paris
+        if return_dt.tzinfo is not None:
+            return_hour = return_dt.astimezone(PARIS_TZ).hour
+        else:
+            return_hour = return_dt.hour
+    except (ValueError, TypeError):
+        return
+    
+    # Verifica se lo slot rientra nella fascia desiderata
+    desired_start, desired_end = PA_ALERT_CONFIG[attraction_name]
+    if not (desired_start <= return_hour < desired_end):
+        return
+    
+    # Evita alert duplicati per lo stesso slot nello stesso giorno
+    now_paris = datetime.now(PARIS_TZ)
+    today_str = now_paris.strftime("%Y-%m-%d")
+    alert_key = (attraction_name, today_str, return_hour)
+    
+    if alert_key in _pa_alerts_sent:
+        return
+    
+    # Invia l'alert!
+    price_str = f"{pa_price / 100:.2f}€" if pa_price else "N/A"
+    
+    # Calcola l'orario return in formato leggibile
+    try:
+        if return_dt.tzinfo is not None:
+            return_paris = return_dt.astimezone(PARIS_TZ)
+        else:
+            return_paris = return_dt
+        return_time_str = return_paris.strftime("%H:%M")
+    except Exception:
+        return_time_str = f"{return_hour}:00"
+    
+    message = (
+        f"🎯 <b>PA DISPONIBILE!</b>\n\n"
+        f"<b>{attraction_name}</b>\n"
+        f"🎟 Slot return: <b>{return_time_str}</b>\n"
+        f"💰 Prezzo: <b>{price_str}</b>\n"
+        f"🕐 Rilevato alle: {now_paris.strftime('%H:%M')}\n\n"
+        f"⚡ Fascia desiderata: {desired_start}:00 - {desired_end}:00\n"
+        f"👉 <b>Compra ora prima che lo slot avanzi!</b>"
+    )
+    
+    if send_telegram_message(message):
+        _pa_alerts_sent[alert_key] = True
+        logger.info(f"PA Alert inviato: {attraction_name} slot {return_time_str} ({price_str})")
+
+
 def send_cycle_summary(conn, parks: list):
     """
     Invia un riepilogo del ciclo con le code attuali più basse (top 5).
