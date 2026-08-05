@@ -369,6 +369,217 @@ def get_single_rider_comparison(conn, date_range=None) -> pd.DataFrame:
     return pd.read_sql(query, conn, params=params)
 
 
+# === QUERY: Analisi dettagliata Premier Access per attrazioni target ===
+
+# Le 4 attrazioni target per l'analisi PA dettagliata
+PA_TARGET_ATTRACTIONS = [
+    "Crush's Coaster",
+    "Big Thunder Mountain",
+    "Frozen Ever After",
+    "Star Wars Hyperspace Mountain",
+]
+
+
+def get_pa_slot_first_appearance(conn, date_range=None) -> pd.DataFrame:
+    """
+    Per ogni giornata e ogni attrazione target, trova la PRIMA volta (sampled_at)
+    in cui ogni fascia oraria di return (es. 17:00-18:00) è apparsa come AVAILABLE.
+    
+    Questo permette di capire: "Lo slot delle 17 diventa disponibile alle 9:15 del mattino".
+    
+    Restituisce: attraction_name, giorno, return_slot (HH:MM-HH:MM), 
+                 prima_apparizione (timestamp), prezzo al momento.
+    """
+    placeholders = ",".join(["%s"] * len(PA_TARGET_ATTRACTIONS))
+    
+    query = f"""
+        WITH slot_appearances AS (
+            SELECT 
+                attraction_name,
+                DATE(sampled_at) as giorno,
+                TO_CHAR(premier_access_return_start AT TIME ZONE 'Europe/Paris', 'HH24:MI') as return_start,
+                TO_CHAR(premier_access_return_end AT TIME ZONE 'Europe/Paris', 'HH24:MI') as return_end,
+                sampled_at,
+                premier_access_price,
+                ROW_NUMBER() OVER (
+                    PARTITION BY attraction_name, DATE(sampled_at), 
+                    TO_CHAR(premier_access_return_start AT TIME ZONE 'Europe/Paris', 'HH24:MI')
+                    ORDER BY sampled_at ASC
+                ) as rn
+            FROM wait_times
+            WHERE attraction_name IN ({placeholders})
+              AND premier_access_state = 'AVAILABLE'
+              AND premier_access_return_start IS NOT NULL
+              AND status = 'OPERATING'
+    """
+    params = list(PA_TARGET_ATTRACTIONS)
+    
+    if date_range is not None:
+        query += " AND sampled_at >= %s AND sampled_at <= %s"
+        params.extend(date_range)
+    
+    query += """
+        )
+        SELECT 
+            attraction_name,
+            giorno,
+            return_start || ' - ' || return_end as return_slot,
+            return_start,
+            sampled_at as prima_apparizione,
+            TO_CHAR(sampled_at AT TIME ZONE 'Europe/Paris', 'HH24:MI') as ora_apparizione,
+            premier_access_price as prezzo
+        FROM slot_appearances
+        WHERE rn = 1
+        ORDER BY attraction_name, giorno DESC, return_start;
+    """
+    
+    return pd.read_sql(query, conn, params=params)
+
+
+def get_pa_availability_timeline(conn, attraction_name: str, date_range=None) -> pd.DataFrame:
+    """
+    Per una singola attrazione target, mostra l'evoluzione del PA durante la giornata:
+    - A ogni campionamento, quale slot viene offerto, a che prezzo, e lo stato.
+    
+    Utile per vedere la timeline completa: come gli slot si muovono durante il giorno.
+    """
+    query = """
+        SELECT 
+            DATE(sampled_at) as giorno,
+            TO_CHAR(sampled_at AT TIME ZONE 'Europe/Paris', 'HH24:MI') as ora_campionamento,
+            sampled_at,
+            premier_access_state as stato,
+            TO_CHAR(premier_access_return_start AT TIME ZONE 'Europe/Paris', 'HH24:MI') as slot_inizio,
+            TO_CHAR(premier_access_return_end AT TIME ZONE 'Europe/Paris', 'HH24:MI') as slot_fine,
+            premier_access_price as prezzo
+        FROM wait_times
+        WHERE attraction_name = %s
+          AND status = 'OPERATING'
+          AND premier_access_state IS NOT NULL
+    """
+    params = [attraction_name]
+    
+    if date_range is not None:
+        query += " AND sampled_at >= %s AND sampled_at <= %s"
+        params.extend(date_range)
+    
+    query += " ORDER BY sampled_at;"
+    
+    return pd.read_sql(query, conn, params=params)
+
+
+def get_pa_slot_availability_pattern(conn, date_range=None) -> pd.DataFrame:
+    """
+    Pattern medio: per ogni attrazione target e ogni fascia return slot,
+    calcola l'ORA MEDIA in cui quel slot diventa disponibile per la prima volta.
+    
+    Es: "Il PA per le 17:00 di Crush's Coaster in media appare alle 9:23"
+    
+    Questo è il dato chiave per sapere quando connettersi.
+    """
+    placeholders = ",".join(["%s"] * len(PA_TARGET_ATTRACTIONS))
+    
+    query = f"""
+        WITH first_appearances AS (
+            SELECT 
+                attraction_name,
+                DATE(sampled_at) as giorno,
+                EXTRACT(HOUR FROM premier_access_return_start AT TIME ZONE 'Europe/Paris') as return_hour,
+                MIN(sampled_at) as first_seen
+            FROM wait_times
+            WHERE attraction_name IN ({placeholders})
+              AND premier_access_state = 'AVAILABLE'
+              AND premier_access_return_start IS NOT NULL
+              AND status = 'OPERATING'
+    """
+    params = list(PA_TARGET_ATTRACTIONS)
+    
+    if date_range is not None:
+        query += " AND sampled_at >= %s AND sampled_at <= %s"
+        params.extend(date_range)
+    
+    query += f"""
+            GROUP BY attraction_name, DATE(sampled_at), 
+                     EXTRACT(HOUR FROM premier_access_return_start AT TIME ZONE 'Europe/Paris')
+        )
+        SELECT 
+            attraction_name,
+            return_hour::int as slot_ora,
+            TO_CHAR(
+                MAKE_INTERVAL(secs => AVG(EXTRACT(HOUR FROM first_seen AT TIME ZONE 'Europe/Paris') * 3600 
+                    + EXTRACT(MINUTE FROM first_seen AT TIME ZONE 'Europe/Paris') * 60)),
+                'HH24:MI'
+            ) as ora_media_disponibilita,
+            TO_CHAR(
+                MAKE_INTERVAL(secs => MIN(EXTRACT(HOUR FROM first_seen AT TIME ZONE 'Europe/Paris') * 3600 
+                    + EXTRACT(MINUTE FROM first_seen AT TIME ZONE 'Europe/Paris') * 60)),
+                'HH24:MI'
+            ) as ora_min_disponibilita,
+            TO_CHAR(
+                MAKE_INTERVAL(secs => MAX(EXTRACT(HOUR FROM first_seen AT TIME ZONE 'Europe/Paris') * 3600 
+                    + EXTRACT(MINUTE FROM first_seen AT TIME ZONE 'Europe/Paris') * 60)),
+                'HH24:MI'
+            ) as ora_max_disponibilita,
+            COUNT(*) as giorni_osservati
+        FROM first_appearances
+        GROUP BY attraction_name, return_hour
+        ORDER BY attraction_name, return_hour;
+    """
+    
+    return pd.read_sql(query, conn, params=params)
+
+
+def get_pa_price_evolution(conn, attraction_name: str, date_range=None) -> pd.DataFrame:
+    """
+    Evoluzione del prezzo PA durante la giornata per una attrazione target.
+    Mostra come il prezzo cambia ora per ora (media su tutti i giorni).
+    """
+    query = """
+        SELECT 
+            hour_of_day,
+            ROUND(AVG(premier_access_price)) as prezzo_medio,
+            MIN(premier_access_price) as prezzo_min,
+            MAX(premier_access_price) as prezzo_max,
+            COUNT(*) as campionamenti
+        FROM wait_times
+        WHERE attraction_name = %s
+          AND status = 'OPERATING'
+          AND premier_access_state = 'AVAILABLE'
+          AND premier_access_price IS NOT NULL
+    """
+    params = [attraction_name]
+    
+    if date_range is not None:
+        query += " AND sampled_at >= %s AND sampled_at <= %s"
+        params.extend(date_range)
+    
+    query += " GROUP BY hour_of_day ORDER BY hour_of_day;"
+    
+    return pd.read_sql(query, conn, params=params)
+
+
+def get_pa_daily_detail(conn, attraction_name: str, target_date: str) -> pd.DataFrame:
+    """
+    Dettaglio completo di un singolo giorno per una attrazione:
+    tutti i campionamenti PA con slot e prezzo, ordinati cronologicamente.
+    """
+    query = """
+        SELECT 
+            TO_CHAR(sampled_at AT TIME ZONE 'Europe/Paris', 'HH24:MI') as ora,
+            premier_access_state as stato,
+            TO_CHAR(premier_access_return_start AT TIME ZONE 'Europe/Paris', 'HH24:MI') as slot_inizio,
+            TO_CHAR(premier_access_return_end AT TIME ZONE 'Europe/Paris', 'HH24:MI') as slot_fine,
+            premier_access_price as prezzo
+        FROM wait_times
+        WHERE attraction_name = %s
+          AND DATE(sampled_at) = %s
+          AND status = 'OPERATING'
+          AND premier_access_state IS NOT NULL
+        ORDER BY sampled_at;
+    """
+    return pd.read_sql(query, conn, params=(attraction_name, target_date))
+
+
 def get_shows_schedule(conn) -> pd.DataFrame:
     """
     Recupera tutti gli orari degli show salvati, raggruppati per show e data.

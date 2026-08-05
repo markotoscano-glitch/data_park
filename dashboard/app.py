@@ -34,6 +34,12 @@ from queries import (
     get_shows_list,
     get_show_times_by_name,
     get_show_changes,
+    PA_TARGET_ATTRACTIONS,
+    get_pa_slot_first_appearance,
+    get_pa_availability_timeline,
+    get_pa_slot_availability_pattern,
+    get_pa_price_evolution,
+    get_pa_daily_detail,
 )
 from charts import (
     bar_chart_by_hour,
@@ -128,12 +134,13 @@ def main():
     conn = get_conn()
     
     # --- TABS PRINCIPALI ---
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "📊 Panoramica",
         "🎢 Analisi Attrazione",
         "📈 Trend Storico",
         "🔄 Confronto Attrazioni",
         "⚡ Single Rider & Premier Access",
+        "🎯 PA Strategy",
         "🗺️ Planner Giornaliero",
         "🎭 Show & Spettacoli"
     ])
@@ -430,8 +437,181 @@ def main():
             else:
                 st.info("Dati return slot non ancora disponibili. Attendi più campionamenti.")
     
-    # ===== TAB 6: PLANNER GIORNALIERO =====
+    # ===== TAB 6: PA STRATEGY =====
     with tab6:
+        st.header("🎯 Premier Access Strategy")
+        st.markdown(
+            "Analisi dettagliata per capire **a che ora** diventano disponibili gli slot Premier Access "
+            "delle attrazioni più ambite. Usa questi dati per sapere quando connetterti e comprare il PA."
+        )
+        st.markdown(f"**Attrazioni monitorate:** {', '.join(PA_TARGET_ATTRACTIONS)}")
+        
+        st.divider()
+        
+        # --- SEZIONE 1: Pattern medio — A che ora appare ogni slot ---
+        st.subheader("📊 Pattern medio: quando appare ogni slot")
+        st.markdown(
+            "Per ogni attrazione e ogni fascia oraria di return, mostra l'ora media "
+            "(e il range min-max) in cui quel slot è apparso per la prima volta."
+        )
+        
+        df_pattern = get_pa_slot_availability_pattern(conn, date_range=date_range)
+        if not df_pattern.empty:
+            for attr_name in PA_TARGET_ATTRACTIONS:
+                df_attr = df_pattern[df_pattern["attraction_name"] == attr_name]
+                if not df_attr.empty:
+                    st.markdown(f"#### {attr_name}")
+                    display_df = df_attr[["slot_ora", "ora_media_disponibilita", "ora_min_disponibilita", "ora_max_disponibilita", "giorni_osservati"]].copy()
+                    display_df.columns = ["Slot (ora return)", "Disponibile alle (media)", "Prima volta (min)", "Più tardi (max)", "Giorni osservati"]
+                    display_df["Slot (ora return)"] = display_df["Slot (ora return)"].apply(lambda h: f"{int(h)}:00 - {int(h)+1}:00")
+                    st.dataframe(display_df, use_container_width=True, hide_index=True)
+                    st.markdown("")
+        else:
+            st.info("📭 Nessun dato Premier Access disponibile ancora. Il poller deve raccogliere più campionamenti.")
+        
+        st.divider()
+        
+        # --- SEZIONE 2: Dettaglio per giorno — Prima apparizione di ogni slot ---
+        st.subheader("📅 Dettaglio giornaliero: prima apparizione di ogni slot")
+        st.markdown("Mostra esattamente a che ora è apparso per la prima volta ogni slot in ogni giornata.")
+        
+        df_first = get_pa_slot_first_appearance(conn, date_range=date_range)
+        if not df_first.empty:
+            pa_attr_select = st.selectbox(
+                "Seleziona attrazione",
+                options=PA_TARGET_ATTRACTIONS,
+                index=0,
+                key="pa_strategy_attr"
+            )
+            
+            df_attr_first = df_first[df_first["attraction_name"] == pa_attr_select].copy()
+            if not df_attr_first.empty:
+                # Mostra gli ultimi 7 giorni
+                giorni_disponibili = sorted(df_attr_first["giorno"].unique(), reverse=True)
+                
+                for giorno in giorni_disponibili[:7]:
+                    df_day = df_attr_first[df_attr_first["giorno"] == giorno].sort_values("return_start")
+                    giorno_str = giorno.strftime("%A %d/%m/%Y") if hasattr(giorno, 'strftime') else str(giorno)
+                    st.markdown(f"**{giorno_str}**")
+                    
+                    display_day = df_day[["return_slot", "ora_apparizione", "prezzo"]].copy()
+                    display_day.columns = ["Slot Return", "Apparso alle", "Prezzo (cent)"]
+                    display_day["Prezzo (€)"] = (display_day["Prezzo (cent)"] / 100).round(2)
+                    display_day = display_day[["Slot Return", "Apparso alle", "Prezzo (€)"]]
+                    st.dataframe(display_day, use_container_width=True, hide_index=True)
+                    st.markdown("")
+            else:
+                st.info(f"Nessun dato PA disponibile per {pa_attr_select}.")
+        else:
+            st.info("📭 Dati insufficienti. Attendi più campionamenti dal poller.")
+        
+        st.divider()
+        
+        # --- SEZIONE 3: Evoluzione prezzo durante la giornata ---
+        st.subheader("💰 Evoluzione prezzo durante la giornata")
+        st.markdown("Come varia il prezzo del Premier Access ora per ora (media su tutti i giorni).")
+        
+        pa_price_attr = st.selectbox(
+            "Seleziona attrazione",
+            options=PA_TARGET_ATTRACTIONS,
+            index=0,
+            key="pa_price_attr"
+        )
+        
+        df_price = get_pa_price_evolution(conn, pa_price_attr, date_range=date_range)
+        if not df_price.empty:
+            import plotly.graph_objects as go
+            df_price_display = df_price.copy()
+            df_price_display["prezzo_medio_eur"] = df_price_display["prezzo_medio"] / 100
+            df_price_display["prezzo_min_eur"] = df_price_display["prezzo_min"] / 100
+            df_price_display["prezzo_max_eur"] = df_price_display["prezzo_max"] / 100
+            
+            fig_price = go.Figure()
+            fig_price.add_trace(go.Scatter(
+                x=df_price_display["hour_of_day"],
+                y=df_price_display["prezzo_max_eur"],
+                mode="lines",
+                name="Max",
+                line=dict(width=0),
+                showlegend=False
+            ))
+            fig_price.add_trace(go.Scatter(
+                x=df_price_display["hour_of_day"],
+                y=df_price_display["prezzo_min_eur"],
+                mode="lines",
+                name="Range prezzo",
+                fill="tonexty",
+                fillcolor="rgba(255, 107, 107, 0.2)",
+                line=dict(width=0)
+            ))
+            fig_price.add_trace(go.Scatter(
+                x=df_price_display["hour_of_day"],
+                y=df_price_display["prezzo_medio_eur"],
+                mode="lines+markers",
+                name="Prezzo medio",
+                line=dict(color="#FF6B6B", width=3)
+            ))
+            fig_price.update_layout(
+                title=f"Prezzo Premier Access — {pa_price_attr}",
+                xaxis_title="Ora del giorno",
+                yaxis_title="Prezzo (€)",
+                xaxis=dict(dtick=1)
+            )
+            st.plotly_chart(fig_price, use_container_width=True, key="chart_pa_price_evo")
+        else:
+            st.info(f"Nessun dato prezzo per {pa_price_attr}.")
+        
+        st.divider()
+        
+        # --- SEZIONE 4: Timeline completa di un giorno specifico ---
+        st.subheader("🔬 Analisi dettagliata di un giorno specifico")
+        st.markdown("Seleziona un'attrazione e una data per vedere TUTTI i campionamenti PA di quella giornata.")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            pa_detail_attr = st.selectbox(
+                "Attrazione",
+                options=PA_TARGET_ATTRACTIONS,
+                index=0,
+                key="pa_detail_attr"
+            )
+        with col2:
+            pa_detail_date = st.date_input(
+                "Data",
+                value=date.today() - timedelta(days=1),
+                key="pa_detail_date"
+            )
+        
+        df_detail = get_pa_daily_detail(conn, pa_detail_attr, str(pa_detail_date))
+        if not df_detail.empty:
+            df_detail_display = df_detail.copy()
+            df_detail_display["prezzo_eur"] = (df_detail_display["prezzo"] / 100).round(2)
+            df_detail_display["slot"] = df_detail_display["slot_inizio"] + " - " + df_detail_display["slot_fine"]
+            
+            final_display = df_detail_display[["ora", "stato", "slot", "prezzo_eur"]].copy()
+            final_display.columns = ["Ora campionamento", "Stato", "Slot Return", "Prezzo (€)"]
+            st.dataframe(final_display, use_container_width=True, hide_index=True)
+            
+            # Evidenzia info chiave
+            available_rows = df_detail_display[df_detail_display["stato"] == "AVAILABLE"]
+            if not available_rows.empty:
+                first_available = available_rows.iloc[0]["ora"]
+                last_available = available_rows.iloc[-1]["ora"]
+                st.success(
+                    f"✅ PA disponibile dalle **{first_available}** alle **{last_available}** | "
+                    f"Slot iniziale: **{available_rows.iloc[0]['slot']}** → "
+                    f"Slot finale: **{available_rows.iloc[-1]['slot']}**"
+                )
+            
+            finished_rows = df_detail_display[df_detail_display["stato"] == "FINISHED"]
+            if not finished_rows.empty:
+                first_finished = finished_rows.iloc[0]["ora"]
+                st.error(f"❌ PA esaurito alle **{first_finished}**")
+        else:
+            st.info(f"Nessun dato per {pa_detail_attr} il {pa_detail_date}. Potrebbe non esserci stato campionamento.")
+
+    # ===== TAB 7: PLANNER GIORNALIERO =====
+    with tab7:
         st.header("🗺️ Planner Giornaliero")
         st.markdown(
             "Seleziona le attrazioni che vuoi fare e il giorno della settimana. "
@@ -514,8 +694,8 @@ def main():
                         "Il poller deve raccogliere più campionamenti."
                     )
     
-    # ===== TAB 7: SHOW & SPETTACOLI =====
-    with tab7:
+    # ===== TAB 8: SHOW & SPETTACOLI =====
+    with tab8:
         st.header("🎭 Show & Spettacoli")
         st.markdown("Orari delle performance e cambiamenti rilevati nel tempo.")
         
