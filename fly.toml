@@ -1,0 +1,17 @@
+# Configurazione Fly.io per il poller Disneyland Wait Time Monitor
+app = "disneyland-waittime"
+primary_region = "cdg"  # Paris - Charles de Gaulle (più vicino al parco)
+
+[build]
+  dockerfile = "Dockerfile"
+
+# Il poller è un worker (no HTTP), non serve porta
+[processes]
+  poller = "python poller/poller.py"
+
+[env]
+  TZ = "Europe/Paris"
+
+# Nessuna porta HTTP - è un background worker
+# Le variabili sensibili (DATABASE_URL, TELEGRAM_*) vanno impostate con:
+# fly secrets set DATABASE_URL=... TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=...
