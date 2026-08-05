@@ -12,6 +12,138 @@ Schema DB aggiornato:
 import pandas as pd
 
 
+# === QUERY: Indicatore di affollamento ===
+
+# Floor e cap di default per i primi giorni (quando lo storico è scarso)
+CROWD_FLOOR_MINUTES = 5    # media attese minima "teorica"
+CROWD_CAP_MINUTES = 75     # media attese massima "teorica" — verrà sostituita dal max reale
+CROWD_MIN_SAMPLES_FOR_HISTORY = 50  # campionamenti minimi per fidarsi dello storico
+
+
+def get_current_avg_wait(conn) -> dict:
+    """
+    Calcola la media attese di TUTTE le attrazioni OPERATIVE in questo momento
+    (ultimo campionamento disponibile, entro gli ultimi 30 minuti).
+    Restituisce: media attese attuale, numero attrazioni operative, timestamp.
+    """
+    query = """
+        WITH latest AS (
+            SELECT MAX(sampled_at) as last_ts
+            FROM wait_times
+            WHERE status = 'OPERATING' AND wait_minutes IS NOT NULL
+        )
+        SELECT 
+            ROUND(AVG(wt.wait_minutes)) as avg_wait_now,
+            COUNT(DISTINCT wt.attraction_id) as num_attractions,
+            MAX(wt.sampled_at) as last_sample
+        FROM wait_times wt, latest
+        WHERE wt.sampled_at >= latest.last_ts - INTERVAL '30 minutes'
+          AND wt.status = 'OPERATING'
+          AND wt.wait_minutes IS NOT NULL
+          AND wt.entity_type = 'ATTRACTION';
+    """
+    df = pd.read_sql(query, conn)
+    if df.empty or df["avg_wait_now"].iloc[0] is None:
+        return {"avg_wait_now": None, "num_attractions": 0, "last_sample": None}
+    return {
+        "avg_wait_now": float(df["avg_wait_now"].iloc[0]),
+        "num_attractions": int(df["num_attractions"].iloc[0]),
+        "last_sample": df["last_sample"].iloc[0],
+    }
+
+
+def get_crowd_history_range(conn, day_of_week: int, hour_of_day: int) -> dict:
+    """
+    Recupera min e max storici della media attese per la stessa fascia
+    giorno-della-settimana + ora.
+    Restituisce: min_storico, max_storico, media_storica, campionamenti.
+    """
+    query = """
+        WITH hourly_avgs AS (
+            SELECT 
+                DATE(sampled_at) as giorno,
+                ROUND(AVG(wait_minutes)) as avg_wait
+            FROM wait_times
+            WHERE day_of_week = %s
+              AND hour_of_day = %s
+              AND status = 'OPERATING'
+              AND wait_minutes IS NOT NULL
+              AND entity_type = 'ATTRACTION'
+            GROUP BY DATE(sampled_at)
+        )
+        SELECT 
+            MIN(avg_wait) as min_storico,
+            MAX(avg_wait) as max_storico,
+            ROUND(AVG(avg_wait)) as media_storica,
+            COUNT(*) as giorni_campionati
+        FROM hourly_avgs;
+    """
+    df = pd.read_sql(query, conn, params=(day_of_week, hour_of_day))
+    if df.empty or df["giorni_campionati"].iloc[0] == 0:
+        return {"min_storico": None, "max_storico": None, "media_storica": None, "giorni_campionati": 0}
+    return {
+        "min_storico": float(df["min_storico"].iloc[0]),
+        "max_storico": float(df["max_storico"].iloc[0]),
+        "media_storica": float(df["media_storica"].iloc[0]),
+        "giorni_campionati": int(df["giorni_campionati"].iloc[0]),
+    }
+
+
+def calculate_crowd_percentage(avg_wait_now: float, history: dict) -> dict:
+    """
+    Calcola la percentuale di affollamento normalizzata.
+    Usa floor/cap di default se lo storico è insufficiente.
+    
+    Returns: dict con crowd_pct (0-100+), livello (basso/medio/alto/estremo),
+             emoji, affidabilità dello storico.
+    """
+    giorni = history.get("giorni_campionati", 0)
+    
+    # Determina min e max da usare
+    if giorni >= CROWD_MIN_SAMPLES_FOR_HISTORY and history["min_storico"] is not None:
+        min_val = history["min_storico"]
+        max_val = history["max_storico"]
+        reliable = True
+    else:
+        min_val = CROWD_FLOOR_MINUTES
+        max_val = CROWD_CAP_MINUTES
+        reliable = False
+    
+    # Evita divisione per zero
+    range_val = max_val - min_val
+    if range_val <= 0:
+        range_val = 1
+    
+    # Calcolo percentuale
+    crowd_pct = ((avg_wait_now - min_val) / range_val) * 100
+    crowd_pct = max(0, crowd_pct)  # non scende sotto 0
+    # Può superare 100 se oggi è un nuovo record
+    
+    # Livello
+    if crowd_pct <= 30:
+        livello = "Basso"
+        emoji = "🟢"
+    elif crowd_pct <= 60:
+        livello = "Medio"
+        emoji = "🟡"
+    elif crowd_pct <= 85:
+        livello = "Alto"
+        emoji = "🟠"
+    else:
+        livello = "Estremo"
+        emoji = "🔴"
+    
+    return {
+        "crowd_pct": round(crowd_pct, 1),
+        "livello": livello,
+        "emoji": emoji,
+        "reliable": reliable,
+        "giorni_campionati": giorni,
+        "min_used": min_val,
+        "max_used": max_val,
+    }
+
+
 def get_overview_stats(conn) -> dict:
     """
     Recupera le statistiche generali di panoramica:

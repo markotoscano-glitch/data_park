@@ -40,6 +40,9 @@ from queries import (
     get_pa_slot_availability_pattern,
     get_pa_price_evolution,
     get_pa_daily_detail,
+    get_current_avg_wait,
+    get_crowd_history_range,
+    calculate_crowd_percentage,
 )
 from charts import (
     bar_chart_by_hour,
@@ -132,6 +135,48 @@ def main():
     st.markdown("Analisi statistica dei tempi di attesa basata su dati reali raccolti da themeparks.wiki")
     
     conn = get_conn()
+    
+    # --- BANNER AFFOLLAMENTO ---
+    crowd_data = get_current_avg_wait(conn)
+    if crowd_data["avg_wait_now"] is not None:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now_paris = datetime.now(ZoneInfo("Europe/Paris"))
+        history = get_crowd_history_range(conn, now_paris.weekday(), now_paris.hour)
+        crowd = calculate_crowd_percentage(crowd_data["avg_wait_now"], history)
+        
+        # Banner colorato
+        if crowd["crowd_pct"] <= 30:
+            banner_color = "#d4edda"  # verde chiaro
+            text_color = "#155724"
+        elif crowd["crowd_pct"] <= 60:
+            banner_color = "#fff3cd"  # giallo chiaro
+            text_color = "#856404"
+        elif crowd["crowd_pct"] <= 85:
+            banner_color = "#ffe0cc"  # arancione chiaro
+            text_color = "#cc5500"
+        else:
+            banner_color = "#f8d7da"  # rosso chiaro
+            text_color = "#721c24"
+        
+        reliability_note = "" if crowd["reliable"] else " ⚠️ <i>(storico limitato — si auto-calibra col tempo)</i>"
+        last_ts = crowd_data["last_sample"]
+        last_str = last_ts.strftime("%H:%M") if hasattr(last_ts, 'strftime') else str(last_ts)[:5]
+        
+        st.markdown(
+            f'<div style="background-color:{banner_color}; padding:12px 20px; border-radius:8px; '
+            f'margin-bottom:16px; border-left:5px solid {text_color};">'
+            f'<span style="font-size:1.3em;">{crowd["emoji"]} <b>Affollamento: {crowd["crowd_pct"]}%</b> '
+            f'({crowd["livello"]})</span>'
+            f'<span style="margin-left:20px; color:{text_color};">'
+            f'Media attese: <b>{int(crowd_data["avg_wait_now"])} min</b> '
+            f'su {crowd_data["num_attractions"]} attrazioni '
+            f'| Aggiornato alle {last_str}'
+            f'{reliability_note}</span></div>',
+            unsafe_allow_html=True
+        )
+    else:
+        st.info("📊 Affollamento: in attesa del primo campionamento dal poller...")
     
     # --- TABS PRINCIPALI ---
     tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
