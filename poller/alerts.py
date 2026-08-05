@@ -138,18 +138,17 @@ PA_ALERT_CONFIG = {
     "Star Wars Hyperspace Mountain": (9, 13),
 }
 
-# Tiene traccia degli alert già inviati per non spammare
-# Chiave: (attraction_name, data, return_hour) → True se già notificato
-_pa_alerts_sent = {}
-
 
 def check_pa_alert(record: dict):
     """
     Controlla se il Premier Access di un'attrazione target offre uno slot
     nella fascia oraria desiderata. Se sì, invia un alert Telegram.
     
-    L'alert viene inviato UNA SOLA VOLTA per attrazione/giorno/slot
-    (evita spam ogni 30 min).
+    L'alert viene inviato AD OGNI CICLO finché lo slot è nel range desiderato,
+    così l'utente sa in tempo reale che è ancora disponibile.
+    
+    NON richiede status OPERATING — il PA potrebbe apparire anche prima
+    dell'apertura del parco (es. dopo mezzanotte).
     
     Args:
         record: Record appena processato dal poller con premier_access_* fields.
@@ -177,9 +176,10 @@ def check_pa_alert(record: dict):
         
         # Converti a Europe/Paris
         if return_dt.tzinfo is not None:
-            return_hour = return_dt.astimezone(PARIS_TZ).hour
+            return_paris = return_dt.astimezone(PARIS_TZ)
         else:
-            return_hour = return_dt.hour
+            return_paris = return_dt
+        return_hour = return_paris.hour
     except (ValueError, TypeError):
         return
     
@@ -188,26 +188,10 @@ def check_pa_alert(record: dict):
     if not (desired_start <= return_hour < desired_end):
         return
     
-    # Evita alert duplicati per lo stesso slot nello stesso giorno
+    # Invia l'alert (ogni ciclo, senza de-duplicazione)
     now_paris = datetime.now(PARIS_TZ)
-    today_str = now_paris.strftime("%Y-%m-%d")
-    alert_key = (attraction_name, today_str, return_hour)
-    
-    if alert_key in _pa_alerts_sent:
-        return
-    
-    # Invia l'alert!
     price_str = f"{pa_price / 100:.2f}€" if pa_price else "N/A"
-    
-    # Calcola l'orario return in formato leggibile
-    try:
-        if return_dt.tzinfo is not None:
-            return_paris = return_dt.astimezone(PARIS_TZ)
-        else:
-            return_paris = return_dt
-        return_time_str = return_paris.strftime("%H:%M")
-    except Exception:
-        return_time_str = f"{return_hour}:00"
+    return_time_str = return_paris.strftime("%H:%M")
     
     message = (
         f"🎯 <b>PA DISPONIBILE!</b>\n\n"
@@ -220,7 +204,6 @@ def check_pa_alert(record: dict):
     )
     
     if send_telegram_message(message):
-        _pa_alerts_sent[alert_key] = True
         logger.info(f"PA Alert inviato: {attraction_name} slot {return_time_str} ({price_str})")
 
 

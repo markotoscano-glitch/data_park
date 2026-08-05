@@ -86,14 +86,15 @@ def parse_attraction(live_data: dict, attraction_id: str, park_name: str) -> dic
                 single_rider_minutes = single_rider.get("waitTime")
             
             # Prezzo Premier Access (PAID_RETURN_TIME)
+            # Estratto SEMPRE (anche fuori orario parco — il PA può essere disponibile dopo mezzanotte)
             premier_access_price = None
             premier_access_currency = None
             premier_access_state = None
             premier_access_return_start = None
             premier_access_return_end = None
-            if status == "OPERATING":
-                queue = entity.get("queue", {})
-                paid_return = queue.get("PAID_RETURN_TIME", {})
+            queue = entity.get("queue", {})
+            paid_return = queue.get("PAID_RETURN_TIME", {})
+            if paid_return:
                 premier_access_state = paid_return.get("state")  # AVAILABLE, FINISHED, etc.
                 price_info = paid_return.get("price", {})
                 if price_info:
