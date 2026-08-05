@@ -61,10 +61,9 @@ st.set_page_config(
 )
 
 
-@st.cache_resource
-def get_db_connection():
+def _create_connection():
     """
-    Crea e cache-a la connessione al database.
+    Crea una nuova connessione al database.
     Supporta sia .env locale che Streamlit Cloud secrets.
     """
     # Prima prova Streamlit secrets (per Streamlit Cloud)
@@ -89,7 +88,7 @@ def get_db_connection():
         database_url = database_url.replace("postgres://", "postgresql://", 1)
     
     try:
-        conn = psycopg2.connect(database_url)
+        conn = psycopg2.connect(database_url, connect_timeout=10)
         conn.autocommit = True
         # Mostra tutti gli orari in Europe/Paris
         with conn.cursor() as cur:
@@ -100,13 +99,33 @@ def get_db_connection():
         st.stop()
 
 
+@st.cache_resource
+def get_db_connection():
+    """Crea e cache-a la connessione, riconnettendo se chiusa."""
+    return _create_connection()
+
+
+def get_conn():
+    """Restituisce una connessione valida, ricreandola se necessario."""
+    conn = get_db_connection()
+    try:
+        # Test se la connessione è ancora viva
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return conn
+    except Exception:
+        # Connessione morta → svuota la cache e ricrea
+        get_db_connection.clear()
+        return get_db_connection()
+
+
 def main():
     """Funzione principale della dashboard."""
     
     st.title("🏰 Disneyland Paris — Wait Time Monitor")
     st.markdown("Analisi statistica dei tempi di attesa basata su dati reali raccolti da themeparks.wiki")
     
-    conn = get_db_connection()
+    conn = get_conn()
     
     # --- TABS PRINCIPALI ---
     tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
