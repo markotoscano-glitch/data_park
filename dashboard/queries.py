@@ -512,57 +512,75 @@ PA_TARGET_ATTRACTIONS = [
 ]
 
 
-def get_pa_slot_first_appearance(conn, date_range=None) -> pd.DataFrame:
+def get_pa_slot_first_appearance(conn, date_range=None, day_filter=None) -> pd.DataFrame:
     """
     Per ogni giornata e ogni attrazione target, trova la PRIMA volta (sampled_at)
     in cui ogni fascia oraria di return (es. 17:00-18:00) è apparsa come AVAILABLE.
+    Include l'indice di affollamento (media attese di tutte le attrazioni nello stesso ciclo).
     
-    Questo permette di capire: "Lo slot delle 17 diventa disponibile alle 9:15 del mattino".
-    
-    Restituisce: attraction_name, giorno, return_slot (HH:MM-HH:MM), 
-                 prima_apparizione (timestamp), prezzo al momento.
+    Restituisce: attraction_name, giorno, day_of_week, return_slot, 
+                 ora_apparizione, prezzo, affollamento.
     """
     placeholders = ",".join(["%s"] * len(PA_TARGET_ATTRACTIONS))
     
     query = f"""
-        WITH slot_appearances AS (
+        WITH cycle_crowd AS (
             SELECT 
-                attraction_name,
                 DATE(sampled_at) as giorno,
-                TO_CHAR(premier_access_return_start AT TIME ZONE 'Europe/Paris', 'HH24:MI') as return_start,
-                TO_CHAR(premier_access_return_end AT TIME ZONE 'Europe/Paris', 'HH24:MI') as return_end,
-                sampled_at,
-                premier_access_price,
-                ROW_NUMBER() OVER (
-                    PARTITION BY attraction_name, DATE(sampled_at), 
-                    TO_CHAR(premier_access_return_start AT TIME ZONE 'Europe/Paris', 'HH24:MI')
-                    ORDER BY sampled_at ASC
-                ) as rn
+                hour_of_day,
+                ROUND(AVG(wait_minutes)) as crowd_avg
             FROM wait_times
-            WHERE attraction_name IN ({placeholders})
-              AND premier_access_state = 'AVAILABLE'
-              AND premier_access_return_start IS NOT NULL
-              AND status = 'OPERATING'
+            WHERE status = 'OPERATING'
+              AND wait_minutes IS NOT NULL
+              AND entity_type = 'ATTRACTION'
+            GROUP BY DATE(sampled_at), hour_of_day
+        ),
+        slot_appearances AS (
+            SELECT 
+                wt.attraction_name,
+                DATE(wt.sampled_at) as giorno,
+                wt.day_of_week,
+                TO_CHAR(wt.premier_access_return_start AT TIME ZONE 'Europe/Paris', 'HH24:MI') as return_start,
+                TO_CHAR(wt.premier_access_return_end AT TIME ZONE 'Europe/Paris', 'HH24:MI') as return_end,
+                wt.sampled_at,
+                wt.premier_access_price,
+                wt.hour_of_day,
+                ROW_NUMBER() OVER (
+                    PARTITION BY wt.attraction_name, DATE(wt.sampled_at), 
+                    TO_CHAR(wt.premier_access_return_start AT TIME ZONE 'Europe/Paris', 'HH24:MI')
+                    ORDER BY wt.sampled_at ASC
+                ) as rn
+            FROM wait_times wt
+            WHERE wt.attraction_name IN ({placeholders})
+              AND wt.premier_access_state = 'AVAILABLE'
+              AND wt.premier_access_return_start IS NOT NULL
+              AND wt.status = 'OPERATING'
     """
     params = list(PA_TARGET_ATTRACTIONS)
     
     if date_range is not None:
-        query += " AND sampled_at >= %s AND sampled_at <= %s"
+        query += " AND wt.sampled_at >= %s AND wt.sampled_at <= %s"
         params.extend(date_range)
+    
+    if day_filter is not None:
+        query += " AND wt.day_of_week = %s"
+        params.append(day_filter)
     
     query += """
         )
         SELECT 
-            attraction_name,
-            giorno,
-            return_start || ' - ' || return_end as return_slot,
-            return_start,
-            sampled_at as prima_apparizione,
-            TO_CHAR(sampled_at AT TIME ZONE 'Europe/Paris', 'HH24:MI') as ora_apparizione,
-            premier_access_price as prezzo
-        FROM slot_appearances
-        WHERE rn = 1
-        ORDER BY attraction_name, giorno DESC, return_start;
+            sa.attraction_name,
+            sa.giorno,
+            sa.day_of_week,
+            sa.return_start || ' - ' || sa.return_end as return_slot,
+            sa.return_start,
+            TO_CHAR(sa.sampled_at AT TIME ZONE 'Europe/Paris', 'HH24:MI') as ora_apparizione,
+            sa.premier_access_price as prezzo,
+            cc.crowd_avg as affollamento
+        FROM slot_appearances sa
+        LEFT JOIN cycle_crowd cc ON cc.giorno = sa.giorno AND cc.hour_of_day = sa.hour_of_day
+        WHERE sa.rn = 1
+        ORDER BY sa.attraction_name, sa.giorno DESC, sa.return_start;
     """
     
     return pd.read_sql(query, conn, params=params)
@@ -600,84 +618,99 @@ def get_pa_availability_timeline(conn, attraction_name: str, date_range=None) ->
     return pd.read_sql(query, conn, params=params)
 
 
-def get_pa_slot_availability_pattern(conn, date_range=None) -> pd.DataFrame:
+def get_pa_slot_availability_pattern(conn, date_range=None, day_filter=None) -> pd.DataFrame:
     """
     Pattern medio: per ogni attrazione target e ogni fascia return slot,
     calcola l'ORA MEDIA in cui quel slot diventa disponibile per la prima volta.
+    Include l'affollamento medio nel momento in cui lo slot appare.
     
     Es: "Il PA per le 17:00 di Crush's Coaster in media appare alle 9:23"
-    
-    Questo è il dato chiave per sapere quando connettersi.
     """
     placeholders = ",".join(["%s"] * len(PA_TARGET_ATTRACTIONS))
     
     query = f"""
-        WITH first_appearances AS (
+        WITH cycle_crowd AS (
             SELECT 
-                attraction_name,
                 DATE(sampled_at) as giorno,
-                EXTRACT(HOUR FROM premier_access_return_start AT TIME ZONE 'Europe/Paris') as return_hour,
-                MIN(sampled_at) as first_seen
+                hour_of_day,
+                ROUND(AVG(wait_minutes)) as crowd_avg
             FROM wait_times
-            WHERE attraction_name IN ({placeholders})
-              AND premier_access_state = 'AVAILABLE'
-              AND premier_access_return_start IS NOT NULL
-              AND status = 'OPERATING'
+            WHERE status = 'OPERATING'
+              AND wait_minutes IS NOT NULL
+              AND entity_type = 'ATTRACTION'
+            GROUP BY DATE(sampled_at), hour_of_day
+        ),
+        first_appearances AS (
+            SELECT 
+                wt.attraction_name,
+                DATE(wt.sampled_at) as giorno,
+                wt.day_of_week,
+                EXTRACT(HOUR FROM wt.premier_access_return_start AT TIME ZONE 'Europe/Paris') as return_hour,
+                MIN(wt.sampled_at) as first_seen,
+                (EXTRACT(HOUR FROM MIN(wt.sampled_at) AT TIME ZONE 'Europe/Paris'))::int as first_seen_hour
+            FROM wait_times wt
+            WHERE wt.attraction_name IN ({placeholders})
+              AND wt.premier_access_state = 'AVAILABLE'
+              AND wt.premier_access_return_start IS NOT NULL
+              AND wt.status = 'OPERATING'
     """
     params = list(PA_TARGET_ATTRACTIONS)
     
     if date_range is not None:
-        query += " AND sampled_at >= %s AND sampled_at <= %s"
+        query += " AND wt.sampled_at >= %s AND wt.sampled_at <= %s"
         params.extend(date_range)
     
+    if day_filter is not None:
+        query += " AND wt.day_of_week = %s"
+        params.append(day_filter)
+    
     query += f"""
-            GROUP BY attraction_name, DATE(sampled_at), 
-                     EXTRACT(HOUR FROM premier_access_return_start AT TIME ZONE 'Europe/Paris')
+            GROUP BY wt.attraction_name, DATE(wt.sampled_at), wt.day_of_week,
+                     EXTRACT(HOUR FROM wt.premier_access_return_start AT TIME ZONE 'Europe/Paris')
         )
         SELECT 
-            attraction_name,
-            return_hour::int as slot_ora,
+            fa.attraction_name,
+            fa.return_hour::int as slot_ora,
             TO_CHAR(
-                MAKE_INTERVAL(secs => AVG(EXTRACT(HOUR FROM first_seen AT TIME ZONE 'Europe/Paris') * 3600 
-                    + EXTRACT(MINUTE FROM first_seen AT TIME ZONE 'Europe/Paris') * 60)),
+                MAKE_INTERVAL(secs => AVG(EXTRACT(HOUR FROM fa.first_seen AT TIME ZONE 'Europe/Paris') * 3600 
+                    + EXTRACT(MINUTE FROM fa.first_seen AT TIME ZONE 'Europe/Paris') * 60)),
                 'HH24:MI'
             ) as ora_media_disponibilita,
             TO_CHAR(
-                MAKE_INTERVAL(secs => MIN(EXTRACT(HOUR FROM first_seen AT TIME ZONE 'Europe/Paris') * 3600 
-                    + EXTRACT(MINUTE FROM first_seen AT TIME ZONE 'Europe/Paris') * 60)),
+                MAKE_INTERVAL(secs => MIN(EXTRACT(HOUR FROM fa.first_seen AT TIME ZONE 'Europe/Paris') * 3600 
+                    + EXTRACT(MINUTE FROM fa.first_seen AT TIME ZONE 'Europe/Paris') * 60)),
                 'HH24:MI'
             ) as ora_min_disponibilita,
             TO_CHAR(
-                MAKE_INTERVAL(secs => MAX(EXTRACT(HOUR FROM first_seen AT TIME ZONE 'Europe/Paris') * 3600 
-                    + EXTRACT(MINUTE FROM first_seen AT TIME ZONE 'Europe/Paris') * 60)),
+                MAKE_INTERVAL(secs => MAX(EXTRACT(HOUR FROM fa.first_seen AT TIME ZONE 'Europe/Paris') * 3600 
+                    + EXTRACT(MINUTE FROM fa.first_seen AT TIME ZONE 'Europe/Paris') * 60)),
                 'HH24:MI'
             ) as ora_max_disponibilita,
+            ROUND(AVG(cc.crowd_avg)) as affollamento_medio,
             COUNT(*) as giorni_osservati
-        FROM first_appearances
-        GROUP BY attraction_name, return_hour
-        ORDER BY attraction_name, return_hour;
+        FROM first_appearances fa
+        LEFT JOIN cycle_crowd cc ON cc.giorno = fa.giorno AND cc.hour_of_day = fa.first_seen_hour
+        GROUP BY fa.attraction_name, fa.return_hour
+        ORDER BY fa.attraction_name, fa.return_hour;
     """
     
     return pd.read_sql(query, conn, params=params)
 
 
-def get_pa_price_evolution(conn, attraction_name: str, date_range=None) -> pd.DataFrame:
+def get_pa_price_evolution(conn, attraction_name: str, date_range=None, day_filter=None) -> pd.DataFrame:
     """
     Evoluzione del prezzo PA durante la giornata per una attrazione target.
     Mostra come il prezzo cambia ora per ora (media su tutti i giorni).
+    Include affollamento medio per ogni ora.
     """
     query = """
-        SELECT 
-            hour_of_day,
-            ROUND(AVG(premier_access_price)) as prezzo_medio,
-            MIN(premier_access_price) as prezzo_min,
-            MAX(premier_access_price) as prezzo_max,
-            COUNT(*) as campionamenti
-        FROM wait_times
-        WHERE attraction_name = %s
-          AND status = 'OPERATING'
-          AND premier_access_state = 'AVAILABLE'
-          AND premier_access_price IS NOT NULL
+        WITH pa_data AS (
+            SELECT hour_of_day, premier_access_price, DATE(sampled_at) as giorno
+            FROM wait_times
+            WHERE attraction_name = %s
+              AND status = 'OPERATING'
+              AND premier_access_state = 'AVAILABLE'
+              AND premier_access_price IS NOT NULL
     """
     params = [attraction_name]
     
@@ -685,7 +718,31 @@ def get_pa_price_evolution(conn, attraction_name: str, date_range=None) -> pd.Da
         query += " AND sampled_at >= %s AND sampled_at <= %s"
         params.extend(date_range)
     
-    query += " GROUP BY hour_of_day ORDER BY hour_of_day;"
+    if day_filter is not None:
+        query += " AND day_of_week = %s"
+        params.append(day_filter)
+    
+    query += """
+        ),
+        crowd AS (
+            SELECT DATE(sampled_at) as giorno, hour_of_day,
+                   ROUND(AVG(wait_minutes)) as crowd_avg
+            FROM wait_times
+            WHERE status = 'OPERATING' AND wait_minutes IS NOT NULL AND entity_type = 'ATTRACTION'
+            GROUP BY DATE(sampled_at), hour_of_day
+        )
+        SELECT 
+            pa.hour_of_day,
+            ROUND(AVG(pa.premier_access_price)) as prezzo_medio,
+            MIN(pa.premier_access_price) as prezzo_min,
+            MAX(pa.premier_access_price) as prezzo_max,
+            ROUND(AVG(c.crowd_avg)) as affollamento_medio,
+            COUNT(*) as campionamenti
+        FROM pa_data pa
+        LEFT JOIN crowd c ON c.giorno = pa.giorno AND c.hour_of_day = pa.hour_of_day
+        GROUP BY pa.hour_of_day 
+        ORDER BY pa.hour_of_day;
+    """
     
     return pd.read_sql(query, conn, params=params)
 
@@ -694,22 +751,33 @@ def get_pa_daily_detail(conn, attraction_name: str, target_date: str) -> pd.Data
     """
     Dettaglio completo di un singolo giorno per una attrazione:
     tutti i campionamenti PA con slot e prezzo, ordinati cronologicamente.
+    Include l'affollamento (media attese di tutte le attrazioni) per ogni campionamento.
     """
     query = """
+        WITH crowd AS (
+            SELECT DATE(sampled_at) as giorno, hour_of_day,
+                   ROUND(AVG(wait_minutes)) as crowd_avg
+            FROM wait_times
+            WHERE status = 'OPERATING' AND wait_minutes IS NOT NULL 
+              AND entity_type = 'ATTRACTION' AND DATE(sampled_at) = %s
+            GROUP BY DATE(sampled_at), hour_of_day
+        )
         SELECT 
-            TO_CHAR(sampled_at AT TIME ZONE 'Europe/Paris', 'HH24:MI') as ora,
-            premier_access_state as stato,
-            TO_CHAR(premier_access_return_start AT TIME ZONE 'Europe/Paris', 'HH24:MI') as slot_inizio,
-            TO_CHAR(premier_access_return_end AT TIME ZONE 'Europe/Paris', 'HH24:MI') as slot_fine,
-            premier_access_price as prezzo
-        FROM wait_times
-        WHERE attraction_name = %s
-          AND DATE(sampled_at) = %s
-          AND status = 'OPERATING'
-          AND premier_access_state IS NOT NULL
-        ORDER BY sampled_at;
+            TO_CHAR(wt.sampled_at AT TIME ZONE 'Europe/Paris', 'HH24:MI') as ora,
+            wt.premier_access_state as stato,
+            TO_CHAR(wt.premier_access_return_start AT TIME ZONE 'Europe/Paris', 'HH24:MI') as slot_inizio,
+            TO_CHAR(wt.premier_access_return_end AT TIME ZONE 'Europe/Paris', 'HH24:MI') as slot_fine,
+            wt.premier_access_price as prezzo,
+            c.crowd_avg as affollamento
+        FROM wait_times wt
+        LEFT JOIN crowd c ON c.giorno = DATE(wt.sampled_at) AND c.hour_of_day = wt.hour_of_day
+        WHERE wt.attraction_name = %s
+          AND DATE(wt.sampled_at) = %s
+          AND wt.status = 'OPERATING'
+          AND wt.premier_access_state IS NOT NULL
+        ORDER BY wt.sampled_at;
     """
-    return pd.read_sql(query, conn, params=(attraction_name, target_date))
+    return pd.read_sql(query, conn, params=(target_date, attraction_name, target_date))
 
 
 def get_shows_schedule(conn) -> pd.DataFrame:

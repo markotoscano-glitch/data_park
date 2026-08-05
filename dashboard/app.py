@@ -13,6 +13,7 @@ Avvio: streamlit run dashboard/app.py
 import os
 import streamlit as st
 import psycopg2
+import pandas as pd
 from dotenv import load_dotenv
 from datetime import date, timedelta
 
@@ -491,23 +492,35 @@ def main():
         )
         st.markdown(f"**Attrazioni monitorate:** {', '.join(PA_TARGET_ATTRACTIONS)}")
         
+        # --- FILTRO GIORNO DELLA SETTIMANA (specifico per questa tab) ---
+        pa_day_option = st.selectbox(
+            "📅 Filtra per giorno della settimana",
+            options=["Tutti i giorni"] + GIORNI_SETTIMANA,
+            index=0,
+            key="pa_strategy_day_filter"
+        )
+        pa_day_filter = None
+        if pa_day_option != "Tutti i giorni":
+            pa_day_filter = GIORNI_SETTIMANA.index(pa_day_option)
+        
         st.divider()
         
         # --- SEZIONE 1: Pattern medio — A che ora appare ogni slot ---
         st.subheader("📊 Pattern medio: quando appare ogni slot")
         st.markdown(
             "Per ogni attrazione e ogni fascia oraria di return, mostra l'ora media "
-            "(e il range min-max) in cui quel slot è apparso per la prima volta."
+            "(e il range min-max) in cui quel slot è apparso per la prima volta. "
+            "La colonna **Affollamento** indica la media attese del parco in quel momento."
         )
         
-        df_pattern = get_pa_slot_availability_pattern(conn, date_range=date_range)
+        df_pattern = get_pa_slot_availability_pattern(conn, date_range=date_range, day_filter=pa_day_filter)
         if not df_pattern.empty:
             for attr_name in PA_TARGET_ATTRACTIONS:
                 df_attr = df_pattern[df_pattern["attraction_name"] == attr_name]
                 if not df_attr.empty:
                     st.markdown(f"#### {attr_name}")
-                    display_df = df_attr[["slot_ora", "ora_media_disponibilita", "ora_min_disponibilita", "ora_max_disponibilita", "giorni_osservati"]].copy()
-                    display_df.columns = ["Slot (ora return)", "Disponibile alle (media)", "Prima volta (min)", "Più tardi (max)", "Giorni osservati"]
+                    display_df = df_attr[["slot_ora", "ora_media_disponibilita", "ora_min_disponibilita", "ora_max_disponibilita", "affollamento_medio", "giorni_osservati"]].copy()
+                    display_df.columns = ["Slot (ora return)", "Disponibile alle (media)", "Prima volta (min)", "Più tardi (max)", "Affollamento (min attesa)", "Giorni osservati"]
                     display_df["Slot (ora return)"] = display_df["Slot (ora return)"].apply(lambda h: f"{int(h)}:00 - {int(h)+1}:00")
                     st.dataframe(display_df, use_container_width=True, hide_index=True)
                     st.markdown("")
@@ -518,9 +531,12 @@ def main():
         
         # --- SEZIONE 2: Dettaglio per giorno — Prima apparizione di ogni slot ---
         st.subheader("📅 Dettaglio giornaliero: prima apparizione di ogni slot")
-        st.markdown("Mostra esattamente a che ora è apparso per la prima volta ogni slot in ogni giornata.")
+        st.markdown(
+            "Mostra esattamente a che ora è apparso per la prima volta ogni slot in ogni giornata. "
+            "La colonna **Affollamento** mostra la media attese del parco in quel momento."
+        )
         
-        df_first = get_pa_slot_first_appearance(conn, date_range=date_range)
+        df_first = get_pa_slot_first_appearance(conn, date_range=date_range, day_filter=pa_day_filter)
         if not df_first.empty:
             pa_attr_select = st.selectbox(
                 "Seleziona attrazione",
@@ -537,12 +553,18 @@ def main():
                 for giorno in giorni_disponibili[:7]:
                     df_day = df_attr_first[df_attr_first["giorno"] == giorno].sort_values("return_start")
                     giorno_str = giorno.strftime("%A %d/%m/%Y") if hasattr(giorno, 'strftime') else str(giorno)
-                    st.markdown(f"**{giorno_str}**")
                     
-                    display_day = df_day[["return_slot", "ora_apparizione", "prezzo"]].copy()
-                    display_day.columns = ["Slot Return", "Apparso alle", "Prezzo (cent)"]
+                    # Indicatore affollamento del giorno
+                    avg_crowd = df_day["affollamento"].mean()
+                    crowd_emoji = "🟢" if avg_crowd and avg_crowd <= 20 else "🟡" if avg_crowd and avg_crowd <= 40 else "🟠" if avg_crowd and avg_crowd <= 60 else "🔴"
+                    crowd_str = f" — {crowd_emoji} Affollamento medio: {int(avg_crowd)} min" if avg_crowd and not pd.isna(avg_crowd) else ""
+                    
+                    st.markdown(f"**{giorno_str}**{crowd_str}")
+                    
+                    display_day = df_day[["return_slot", "ora_apparizione", "prezzo", "affollamento"]].copy()
+                    display_day.columns = ["Slot Return", "Apparso alle", "Prezzo (cent)", "Affollamento (min)"]
                     display_day["Prezzo (€)"] = (display_day["Prezzo (cent)"] / 100).round(2)
-                    display_day = display_day[["Slot Return", "Apparso alle", "Prezzo (€)"]]
+                    display_day = display_day[["Slot Return", "Apparso alle", "Prezzo (€)", "Affollamento (min)"]]
                     st.dataframe(display_day, use_container_width=True, hide_index=True)
                     st.markdown("")
             else:
@@ -554,7 +576,7 @@ def main():
         
         # --- SEZIONE 3: Evoluzione prezzo durante la giornata ---
         st.subheader("💰 Evoluzione prezzo durante la giornata")
-        st.markdown("Come varia il prezzo del Premier Access ora per ora (media su tutti i giorni).")
+        st.markdown("Come varia il prezzo del Premier Access ora per ora. Include correlazione con affollamento.")
         
         pa_price_attr = st.selectbox(
             "Seleziona attrazione",
@@ -563,15 +585,19 @@ def main():
             key="pa_price_attr"
         )
         
-        df_price = get_pa_price_evolution(conn, pa_price_attr, date_range=date_range)
+        df_price = get_pa_price_evolution(conn, pa_price_attr, date_range=date_range, day_filter=pa_day_filter)
         if not df_price.empty:
             import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
+            
             df_price_display = df_price.copy()
             df_price_display["prezzo_medio_eur"] = df_price_display["prezzo_medio"] / 100
             df_price_display["prezzo_min_eur"] = df_price_display["prezzo_min"] / 100
             df_price_display["prezzo_max_eur"] = df_price_display["prezzo_max"] / 100
             
-            fig_price = go.Figure()
+            # Grafico doppio asse: prezzo + affollamento
+            fig_price = make_subplots(specs=[[{"secondary_y": True}]])
+            
             fig_price.add_trace(go.Scatter(
                 x=df_price_display["hour_of_day"],
                 y=df_price_display["prezzo_max_eur"],
@@ -579,7 +605,7 @@ def main():
                 name="Max",
                 line=dict(width=0),
                 showlegend=False
-            ))
+            ), secondary_y=False)
             fig_price.add_trace(go.Scatter(
                 x=df_price_display["hour_of_day"],
                 y=df_price_display["prezzo_min_eur"],
@@ -588,20 +614,34 @@ def main():
                 fill="tonexty",
                 fillcolor="rgba(255, 107, 107, 0.2)",
                 line=dict(width=0)
-            ))
+            ), secondary_y=False)
             fig_price.add_trace(go.Scatter(
                 x=df_price_display["hour_of_day"],
                 y=df_price_display["prezzo_medio_eur"],
                 mode="lines+markers",
-                name="Prezzo medio",
+                name="Prezzo medio (€)",
                 line=dict(color="#FF6B6B", width=3)
-            ))
+            ), secondary_y=False)
+            
+            # Affollamento sull'asse secondario
+            if "affollamento_medio" in df_price_display.columns and df_price_display["affollamento_medio"].notna().any():
+                fig_price.add_trace(go.Bar(
+                    x=df_price_display["hour_of_day"],
+                    y=df_price_display["affollamento_medio"],
+                    name="Affollamento (min attesa)",
+                    marker_color="rgba(100, 149, 237, 0.3)",
+                    width=0.6
+                ), secondary_y=True)
+            
             fig_price.update_layout(
-                title=f"Prezzo Premier Access — {pa_price_attr}",
+                title=f"Prezzo PA + Affollamento — {pa_price_attr}",
                 xaxis_title="Ora del giorno",
-                yaxis_title="Prezzo (€)",
-                xaxis=dict(dtick=1)
+                xaxis=dict(dtick=1),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02)
             )
+            fig_price.update_yaxes(title_text="Prezzo (€)", secondary_y=False)
+            fig_price.update_yaxes(title_text="Affollamento (min attesa media)", secondary_y=True)
+            
             st.plotly_chart(fig_price, use_container_width=True, key="chart_pa_price_evo")
         else:
             st.info(f"Nessun dato prezzo per {pa_price_attr}.")
@@ -610,7 +650,7 @@ def main():
         
         # --- SEZIONE 4: Timeline completa di un giorno specifico ---
         st.subheader("🔬 Analisi dettagliata di un giorno specifico")
-        st.markdown("Seleziona un'attrazione e una data per vedere TUTTI i campionamenti PA di quella giornata.")
+        st.markdown("Seleziona un'attrazione e una data per vedere TUTTI i campionamenti PA con affollamento.")
         
         col1, col2 = st.columns(2)
         with col1:
@@ -633,8 +673,8 @@ def main():
             df_detail_display["prezzo_eur"] = (df_detail_display["prezzo"] / 100).round(2)
             df_detail_display["slot"] = df_detail_display["slot_inizio"] + " - " + df_detail_display["slot_fine"]
             
-            final_display = df_detail_display[["ora", "stato", "slot", "prezzo_eur"]].copy()
-            final_display.columns = ["Ora campionamento", "Stato", "Slot Return", "Prezzo (€)"]
+            final_display = df_detail_display[["ora", "stato", "slot", "prezzo_eur", "affollamento"]].copy()
+            final_display.columns = ["Ora", "Stato", "Slot Return", "Prezzo (€)", "Affollamento (min)"]
             st.dataframe(final_display, use_container_width=True, hide_index=True)
             
             # Evidenzia info chiave
@@ -642,10 +682,13 @@ def main():
             if not available_rows.empty:
                 first_available = available_rows.iloc[0]["ora"]
                 last_available = available_rows.iloc[-1]["ora"]
+                avg_crowd_day = available_rows["affollamento"].mean()
+                crowd_note = f" | Affollamento medio: **{int(avg_crowd_day)} min**" if avg_crowd_day and not pd.isna(avg_crowd_day) else ""
                 st.success(
                     f"✅ PA disponibile dalle **{first_available}** alle **{last_available}** | "
                     f"Slot iniziale: **{available_rows.iloc[0]['slot']}** → "
                     f"Slot finale: **{available_rows.iloc[-1]['slot']}**"
+                    f"{crowd_note}"
                 )
             
             finished_rows = df_detail_display[df_detail_display["stato"] == "FINISHED"]
