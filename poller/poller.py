@@ -1,17 +1,18 @@
 """
 poller.py — Loop principale del sistema di monitoraggio tempi di attesa.
-Ogni 30 minuti recupera i dati live da themeparks.wiki e li salva su PostgreSQL.
-Progettato per girare H24 su Railway senza mai crashare.
+Due loop paralleli:
+- Loop PA: ogni 5 minuti monitora le 4 attrazioni target per Premier Access
+- Loop generale: ogni 30 minuti raccoglie tutti i dati (attese, show, alert)
 
+Progettato per girare H24 su Railway senza mai crashare.
 La configurazione dei parchi è nella cartella parks/: un file JSON per parco.
-Ogni JSON contiene la lista delle attrazioni da monitorare (formato API themeparks.wiki).
-Per aggiungere un parco, basta aggiungere un nuovo .json nella cartella.
 """
 
 import json
 import time
 import logging
 import sys
+import threading
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -36,8 +37,30 @@ logger = logging.getLogger("poller")
 # Riduci il log verboso di httpx (polling Telegram)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# Intervallo tra i cicli di polling (30 minuti in secondi)
-POLLING_INTERVAL = 30 * 60  # 1800 secondi
+# Intervalli di polling
+POLLING_INTERVAL = 30 * 60       # 1800 secondi — ciclo generale
+PA_POLLING_INTERVAL = 5 * 60     # 300 secondi — ciclo PA (ogni 5 min)
+
+# Le 4 attrazioni target per il monitoraggio PA ad alta frequenza
+# Formato: {park_id: [attraction_id, ...]}
+PA_TARGET_IDS = {
+    # Disney Adventure World
+    "ca888437-ebb4-4d50-aed2-d227f7096968": [
+        "f0d4b531-e291-471b-9527-00410c2bbd65",   # Crush's Coaster
+        "630e2675-f9fc-4984-ba83-03daf5fc89ed",   # Frozen Ever After
+    ],
+    # Disneyland Park
+    "dae968d5-630d-4719-8b06-3d107e944401": [
+        "852d957c-382e-4afb-bb74-70c9a79055df",   # Big Thunder Mountain
+        "ddca340c-7ba1-4f23-89eb-0d3d52c84bda",   # Star Wars Hyperspace Mountain
+    ],
+}
+
+# Nomi parchi per i log
+PA_PARK_NAMES = {
+    "ca888437-ebb4-4d50-aed2-d227f7096968": "Disney Adventure World",
+    "dae968d5-630d-4719-8b06-3d107e944401": "Disneyland Park",
+}
 
 
 def load_parks() -> list:
@@ -191,12 +214,59 @@ def run_cycle(parks: list):
             continue
 
 
+def run_pa_cycle():
+    """
+    Ciclo rapido: monitora SOLO le 4 attrazioni target per il Premier Access.
+    Salva i dati nel DB (per la dashboard PA Strategy) e invia alert Telegram.
+    Gira ogni 5 minuti, 24/7.
+    """
+    for park_id, attr_ids in PA_TARGET_IDS.items():
+        park_name = PA_PARK_NAMES.get(park_id, park_id)
+        
+        try:
+            live_data = get_live_data(park_id)
+            if live_data is None:
+                logger.warning(f"[PA] Nessun dato per {park_name}")
+                continue
+            
+            for attr_id in attr_ids:
+                try:
+                    record = parse_attraction(live_data, attr_id, park_name)
+                    if record is not None:
+                        insert_wait_time(record)
+                        check_pa_alert(record)
+                except Exception as e:
+                    logger.error(f"[PA] Errore {attr_id}: {e}")
+                    continue
+            
+        except Exception as e:
+            logger.error(f"[PA] Errore ciclo per {park_name}: {e}")
+            continue
+
+
+def pa_loop():
+    """
+    Thread separato: loop infinito per il monitoraggio PA ogni 5 minuti.
+    """
+    logger.info("[PA] Avvio loop Premier Access — ogni 5 minuti, 24/7")
+    pa_cycle_count = 0
+    
+    while True:
+        pa_cycle_count += 1
+        try:
+            run_pa_cycle()
+            logger.info(f"[PA] Ciclo #{pa_cycle_count} completato. Prossimo fra 5 min.")
+        except Exception as e:
+            logger.error(f"[PA] Errore inatteso ciclo #{pa_cycle_count}: {e}")
+        
+        time.sleep(PA_POLLING_INTERVAL)
+
+
 def main():
     """
-    Entry point del poller. Ciclo infinito:
-    1. Carica configurazione dai JSON nella cartella parks/
-    2. Verifica/crea schema DB
-    3. Esegue polling ogni 30 minuti
+    Entry point del poller. Avvia due loop:
+    1. Loop PA (thread separato): ogni 5 minuti, solo 4 attrazioni target
+    2. Loop generale (main thread): ogni 30 minuti, tutte le attrazioni e show
     """
     logger.info("=" * 60)
     logger.info("Avvio Disneyland Paris Wait Time Monitor — Poller")
@@ -220,11 +290,16 @@ def main():
         logger.error(f"Errore nella creazione dello schema DB: {e}", exc_info=True)
         logger.info("Il poller continuerà a tentare nei prossimi cicli...")
     
-    # Loop infinito di polling
+    # Avvia il loop PA in un thread separato (daemon = muore col main)
+    pa_thread = threading.Thread(target=pa_loop, daemon=True)
+    pa_thread.start()
+    logger.info("[PA] Thread Premier Access avviato")
+    
+    # Loop generale (main thread) — ogni 30 minuti
     cycle_count = 0
     while True:
         cycle_count += 1
-        logger.info(f"--- Inizio ciclo #{cycle_count} ---")
+        logger.info(f"--- Inizio ciclo generale #{cycle_count} ---")
         
         try:
             run_cycle(parks)
